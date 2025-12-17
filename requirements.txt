@@ -1,0 +1,9 @@
+flask
+pdfminer.six
+python-docx
+sentence-transformers
+numpy
+torch
+pymupdf
+pytesseract
+Pillow
