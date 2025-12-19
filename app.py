@@ -1,177 +1,164 @@
-"""
-Document Comparison Streamlit App (Single File)
-
-- Semantic similarity (YES / NO)
-- Precise text-level change detection
-- Supports PDF / DOCX / TXT
-- OCR for scanned PDFs
-"""
-
-import difflib
-from io import BytesIO
-from pathlib import Path
-
 import streamlit as st
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from pathlib import Path
+from io import BytesIO
 import docx
+import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
-import fitz  # PyMuPDF
+import pandas as pd
 
-# -----------------------
-# Config
-# -----------------------
-CHUNK_SIZE = 80
-SIMILARITY_THRESHOLD = 0.75
-SIMILARITY_RATIO_FOR_SIMILAR = 0.25
+# ---------------- CONFIG ----------------
+CHUNK_SIZE = 120
+SIM_THRESHOLD = 0.78
+SIM_RATIO_THRESHOLD = 0.25
 
-# -----------------------
-# Load Model
-# -----------------------
+# ---------------- MODEL ----------------
 @st.cache_resource
 def load_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 model = load_model()
 
-# -----------------------
-# Text Helpers
-# -----------------------
+# ---------------- HELPERS ----------------
 def clean_text(text):
     if not text:
         return ""
-    text = text.replace("\r", " ")
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    return "\n".join(lines)
+    text = text.replace("\n", " ").replace("\r", " ")
+    return " ".join(text.split())
 
-# -----------------------
-# File Extraction
-# -----------------------
+def split_chunks(text, size=CHUNK_SIZE):
+    words = text.split()
+    return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
+
+# ---------------- EXTRACTION ----------------
 def extract_pdf(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages = []
+    text = []
+    image_count = 0
 
     for page in doc:
-        text = page.get_text()
-        if text.strip():
-            pages.append(text)
+        page_text = page.get_text()
+        if page_text.strip():
+            text.append(page_text)
         else:
             pix = page.get_pixmap(dpi=200)
             img = Image.open(BytesIO(pix.tobytes("png")))
-            try:
-                ocr_text = pytesseract.image_to_string(img)
-            except:
-                ocr_text = ""
-            pages.append(ocr_text)
+            image_count += 1
+            text.append(pytesseract.image_to_string(img))
 
-    return clean_text("\n".join(pages))
+        image_count += len(page.get_images(full=True))
 
-def extract_text(uploaded_file):
-    ext = Path(uploaded_file.name).suffix.lower()
+    return {
+        "text": clean_text(" ".join(text)),
+        "pages": doc.page_count,
+        "images": image_count
+    }
 
+def extract_docx(file):
+    doc = docx.Document(file)
+    return {
+        "text": clean_text(" ".join(p.text for p in doc.paragraphs)),
+        "pages": 1,
+        "images": 0
+    }
+
+def extract_txt(file):
+    return {
+        "text": clean_text(file.read().decode("utf-8", errors="ignore")),
+        "pages": 1,
+        "images": 0
+    }
+
+def extract(upload):
+    ext = Path(upload.name).suffix.lower()
     if ext == ".pdf":
-        return extract_pdf(uploaded_file.read())
-
+        return extract_pdf(upload.read())
     if ext == ".docx":
-        doc = docx.Document(BytesIO(uploaded_file.read()))
-        return clean_text("\n".join(p.text for p in doc.paragraphs))
-
+        return extract_docx(upload)
     if ext == ".txt":
-        return clean_text(uploaded_file.read().decode("utf-8", errors="ignore"))
+        return extract_txt(upload)
+    return {"text": "", "pages": 0, "images": 0}
 
-    return ""
-
-# -----------------------
-# Chunking & Similarity
-# -----------------------
-def split_into_chunks(text):
-    words = text.split()
-    chunks, buffer = [], []
-
-    for w in words:
-        buffer.append(w)
-        if len(buffer) >= CHUNK_SIZE:
-            chunks.append(" ".join(buffer))
-            buffer = []
-
-    if buffer:
-        chunks.append(" ".join(buffer))
-
-    return chunks
-
-def semantic_similarity(text_a, text_b):
-    chunks_a = split_into_chunks(text_a)
-    chunks_b = split_into_chunks(text_b)
+# ---------------- SEMANTIC MATCH ----------------
+def semantic_diff(text_a, text_b):
+    chunks_a = split_chunks(text_a)
+    chunks_b = split_chunks(text_b)
 
     if not chunks_a or not chunks_b:
-        return "NO"
+        return [], 1.0
 
     emb_a = model.encode(chunks_a, normalize_embeddings=True)
     emb_b = model.encode(chunks_b, normalize_embeddings=True)
 
+    changes = []
     changed = 0
-    for ea in emb_a:
-        sims = np.dot(emb_b, ea)
-        if np.max(sims) < SIMILARITY_THRESHOLD:
+
+    for i, vec in enumerate(emb_a):
+        sims = emb_b @ vec
+        best = float(np.max(sims))
+        if best < SIM_THRESHOLD:
             changed += 1
+            changes.append({
+                "Type": "Content Modified",
+                "Description": f"Section {i+1} rewritten or changed"
+            })
 
     ratio = changed / max(len(chunks_a), 1)
-    return "YES" if ratio < SIMILARITY_RATIO_FOR_SIMILAR else "NO"
+    return changes, ratio
 
-# -----------------------
-# Precise Change Detection
-# -----------------------
-def detect_precise_changes(text_a, text_b):
-    a_lines = text_a.splitlines()
-    b_lines = text_b.splitlines()
-
-    diff = difflib.ndiff(a_lines, b_lines)
-
-    changes = []
-    for line in diff:
-        if line.startswith("- "):
-            changes.append(("Removed", line[2:]))
-        elif line.startswith("+ "):
-            changes.append(("Added", line[2:]))
-
-    return changes
-
-# -----------------------
-# Streamlit UI
-# -----------------------
-st.set_page_config(page_title="Document Comparison", layout="wide")
-st.title("Document Comparison")
+# ---------------- STREAMLIT UI ----------------
+st.set_page_config("Document Comparison", layout="wide")
+st.title("📄 Document Comparison")
 
 col1, col2 = st.columns(2)
 with col1:
-    doc_a = st.file_uploader("Upload Document A", type=["pdf", "docx", "txt"])
+    file_a = st.file_uploader("Upload Document A", type=["pdf", "docx", "txt"])
 with col2:
-    doc_b = st.file_uploader("Upload Document B", type=["pdf", "docx", "txt"])
+    file_b = st.file_uploader("Upload Document B", type=["pdf", "docx", "txt"])
 
 if st.button("Compare Documents"):
-    if not doc_a or not doc_b:
+    if not file_a or not file_b:
         st.error("Please upload both documents.")
     else:
         with st.spinner("Comparing documents..."):
-            text_a = extract_text(doc_a)
-            doc_b.seek(0)
-            text_b = extract_text(doc_b)
+            doc_a = extract(file_a)
+            file_b.seek(0)
+            doc_b = extract(file_b)
 
-            similarity = semantic_similarity(text_a, text_b)
-            changes = detect_precise_changes(text_a, text_b)
+            detected_changes = []
 
-        st.success("Comparison complete")
+            # Page count
+            if doc_a["pages"] != doc_b["pages"]:
+                detected_changes.append({
+                    "Type": "Structural",
+                    "Description": f"Page count changed from {doc_a['pages']} to {doc_b['pages']}"
+                })
 
-        st.subheader("Similarity Result")
-        st.write(f"Documents Similar? **{similarity}**")
+            # Image / signature detection
+            if doc_a["images"] != doc_b["images"]:
+                detected_changes.append({
+                    "Type": "Visual",
+                    "Description": "Visual elements changed (signature, stamp, or image added/removed)"
+                })
 
-        st.subheader("Detected Changes")
+            # Semantic text comparison
+            semantic_changes, change_ratio = semantic_diff(doc_a["text"], doc_b["text"])
+            detected_changes.extend(semantic_changes)
 
-        if not changes:
-            st.info("No exact text changes detected.")
+            similar = "YES" if change_ratio < SIM_RATIO_THRESHOLD and not detected_changes else "NO"
+
+        # ---------------- OUTPUT ----------------
+        st.subheader("Result")
+        st.metric("Documents Similar?", similar)
+
+        if detected_changes:
+            st.subheader("Detected Changes")
+            df = pd.DataFrame(detected_changes)
+            st.table(df)
         else:
-            for i, (ctype, text) in enumerate(changes, 1):
-                st.write(f"{i}. **{ctype}**")
-                st.write(text)
-                st.markdown("---")
+            st.success("No meaningful changes detected.")
+
+        st.caption("Comparison considers structure, visuals, and semantic meaning.")
+
