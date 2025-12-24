@@ -1,75 +1,81 @@
 import streamlit as st
+import fitz  # PyMuPDF
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from pathlib import Path
-from io import BytesIO
-import docx
-import fitz  # PyMuPDF
-from PIL import Image
-import pytesseract
 import pandas as pd
+from pathlib import Path
+import docx
+import difflib
 
 # ---------------- CONFIG ----------------
-CHUNK_SIZE = 120
-SIM_THRESHOLD = 0.78
-SIM_RATIO_THRESHOLD = 0.25
+SIM_THRESHOLD = 0.80
+MAX_DIFF_LINES = 3
 
-# ---------------- MODEL ----------------
+# ---------------- MODEL -----------------
 @st.cache_resource
 def load_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 model = load_model()
 
-# ---------------- HELPERS ----------------
+# ---------------- UTILS -----------------
 def clean_text(text):
     if not text:
         return ""
-    text = text.replace("\n", " ").replace("\r", " ")
-    return " ".join(text.split())
+    return " ".join(text.replace("\n", " ").replace("\r", " ").split())
 
-def split_chunks(text, size=CHUNK_SIZE):
-    words = text.split()
-    return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
+def cosine_similarity(a, b):
+    return float(np.dot(a, b))
+
+def extract_text_diff(a, b):
+    """Extract readable changed text snippets"""
+    a_lines = a.split(". ")
+    b_lines = b.split(". ")
+
+    diff = list(difflib.ndiff(a_lines, b_lines))
+
+    removed = [l[2:] for l in diff if l.startswith("- ")][:MAX_DIFF_LINES]
+    added = [l[2:] for l in diff if l.startswith("+ ")][:MAX_DIFF_LINES]
+
+    return (
+        " | ".join(removed) if removed else "No clear removed text",
+        " | ".join(added) if added else "No clear added text"
+    )
 
 # ---------------- EXTRACTION ----------------
 def extract_pdf(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = []
-    image_count = 0
+    pages = []
 
-    for page in doc:
-        page_text = page.get_text()
-        if page_text.strip():
-            text.append(page_text)
-        else:
-            pix = page.get_pixmap(dpi=200)
-            img = Image.open(BytesIO(pix.tobytes("png")))
-            image_count += 1
-            text.append(pytesseract.image_to_string(img))
+    for page_num, page in enumerate(doc, start=1):
+        text = page.get_text().strip()
+        images_count = len(page.get_images(full=True))
 
-        image_count += len(page.get_images(full=True))
+        # Only use real text layer, ignore scanned images
+        if not text:
+            # Image-only page, mark as no text
+            text = ""
 
-    return {
-        "text": clean_text(" ".join(text)),
-        "pages": doc.page_count,
-        "images": image_count
-    }
+        pages.append({
+            "page": page_num,
+            "text": clean_text(text),
+            "images": images_count
+        })
+
+    return pages, doc.page_count
 
 def extract_docx(file):
     doc = docx.Document(file)
-    return {
-        "text": clean_text(" ".join(p.text for p in doc.paragraphs)),
-        "pages": 1,
-        "images": 0
-    }
+    text = clean_text(" ".join(p.text for p in doc.paragraphs))
+    return [{"page": 1, "text": text, "images": 0}], 1
 
 def extract_txt(file):
-    return {
-        "text": clean_text(file.read().decode("utf-8", errors="ignore")),
-        "pages": 1,
-        "images": 0
-    }
+    raw = file.read()
+    try:
+        text = raw.decode("utf-8")
+    except:
+        text = raw.decode("latin-1")
+    return [{"page": 1, "text": clean_text(text), "images": 0}], 1
 
 def extract(upload):
     ext = Path(upload.name).suffix.lower()
@@ -79,34 +85,74 @@ def extract(upload):
         return extract_docx(upload)
     if ext == ".txt":
         return extract_txt(upload)
-    return {"text": "", "pages": 0, "images": 0}
+    return [], 0
 
-# ---------------- SEMANTIC MATCH ----------------
-def semantic_diff(text_a, text_b):
-    chunks_a = split_chunks(text_a)
-    chunks_b = split_chunks(text_b)
-
-    if not chunks_a or not chunks_b:
-        return [], 1.0
-
-    emb_a = model.encode(chunks_a, normalize_embeddings=True)
-    emb_b = model.encode(chunks_b, normalize_embeddings=True)
-
+# ---------------- COMPARISON ----------------
+def compare_pages(pages_a, pages_b):
     changes = []
-    changed = 0
+    similarities = []
 
-    for i, vec in enumerate(emb_a):
-        sims = emb_b @ vec
-        best = float(np.max(sims))
-        if best < SIM_THRESHOLD:
-            changed += 1
+    max_pages = max(len(pages_a), len(pages_b))
+
+    for i in range(max_pages):
+        page_no = i + 1
+
+        if i >= len(pages_a):
             changes.append({
-                "Type": "Content Modified",
-                "Description": f"Section {i+1} rewritten or changed"
+                "Page": page_no,
+                "Change Type": "Page Added",
+                "Before": "-",
+                "After": "New page added"
+            })
+            continue
+
+        if i >= len(pages_b):
+            changes.append({
+                "Page": page_no,
+                "Change Type": "Page Removed",
+                "Before": "Page existed",
+                "After": "-"
+            })
+            continue
+
+        a = pages_a[i]
+        b = pages_b[i]
+
+        # Visual changes
+        if b["images"] > a["images"]:
+            changes.append({
+                "Page": page_no,
+                "Change Type": "Visual Added",
+                "Before": f"{a['images']} image(s)",
+                "After": f"{b['images']} image(s)"
+            })
+        elif b["images"] < a["images"]:
+            changes.append({
+                "Page": page_no,
+                "Change Type": "Visual Removed",
+                "Before": f"{a['images']} image(s)",
+                "After": f"{b['images']} image(s)"
             })
 
-    ratio = changed / max(len(chunks_a), 1)
-    return changes, ratio
+        # Text changes (only if both pages have real text)
+        if a["text"] and b["text"]:
+            emb = model.encode([a["text"], b["text"]], normalize_embeddings=True)
+            sim = cosine_similarity(emb[0], emb[1])
+            similarities.append(sim)
+
+            if sim < SIM_THRESHOLD:
+                removed, added = extract_text_diff(a["text"], b["text"])
+                changes.append({
+                    "Page": page_no,
+                    "Change Type": "Content Modified",
+                    "Before": removed,
+                    "After": added
+                })
+
+        # If page has no real text, skip text comparison to avoid junk
+
+    avg_similarity = sum(similarities) / max(len(similarities), 1)
+    return changes, avg_similarity
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config("Document Comparison", layout="wide")
@@ -114,51 +160,32 @@ st.title("📄 Document Comparison")
 
 col1, col2 = st.columns(2)
 with col1:
-    file_a = st.file_uploader("Upload Document A", type=["pdf", "docx", "txt"])
+    file_a = st.file_uploader("Upload Document A (Original)", type=["pdf", "docx", "txt"])
 with col2:
-    file_b = st.file_uploader("Upload Document B", type=["pdf", "docx", "txt"])
+    file_b = st.file_uploader("Upload Document B (Updated)", type=["pdf", "docx", "txt"])
 
 if st.button("Compare Documents"):
     if not file_a or not file_b:
         st.error("Please upload both documents.")
     else:
         with st.spinner("Comparing documents..."):
-            doc_a = extract(file_a)
+            pages_a, count_a = extract(file_a)
             file_b.seek(0)
-            doc_b = extract(file_b)
+            pages_b, count_b = extract(file_b)
 
-            detected_changes = []
+            detected_changes, similarity = compare_pages(pages_a, pages_b)
+            documents_similar = "YES" if not detected_changes and count_a == count_b else "NO"
 
-            # Page count
-            if doc_a["pages"] != doc_b["pages"]:
-                detected_changes.append({
-                    "Type": "Structural",
-                    "Description": f"Page count changed from {doc_a['pages']} to {doc_b['pages']}"
-                })
-
-            # Image / signature detection
-            if doc_a["images"] != doc_b["images"]:
-                detected_changes.append({
-                    "Type": "Visual",
-                    "Description": "Visual elements changed (signature, stamp, or image added/removed)"
-                })
-
-            # Semantic text comparison
-            semantic_changes, change_ratio = semantic_diff(doc_a["text"], doc_b["text"])
-            detected_changes.extend(semantic_changes)
-
-            similar = "YES" if change_ratio < SIM_RATIO_THRESHOLD and not detected_changes else "NO"
-
-        # ---------------- OUTPUT ----------------
         st.subheader("Result")
-        st.metric("Documents Similar?", similar)
+        st.metric("Documents Similar?", documents_similar)
 
+        st.subheader("Page Count")
+        st.write(f"Document A: {count_a} pages")
+        st.write(f"Document B: {count_b} pages")
+
+        st.subheader("Detected Changes (Page-wise)")
         if detected_changes:
-            st.subheader("Detected Changes")
-            df = pd.DataFrame(detected_changes)
-            st.table(df)
+            st.dataframe(pd.DataFrame(detected_changes), use_container_width=True)
         else:
-            st.success("No meaningful changes detected.")
-
-        st.caption("Comparison considers structure, visuals, and semantic meaning.")
+            st.success("No significant changes detected.")
 
